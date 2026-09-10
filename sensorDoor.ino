@@ -35,8 +35,11 @@
 //     el codigo.
 //   - Alimentacion: VCC del PIR al pin 5V/VIN del ESP32 (lleva un regulador
 //     HT7133, con 3V3 no arranca). Su OUT entrega 3.3V: va directo al GPIO.
-//   - Warm-up: al energizarse tira HIGH espurios ~30-60s. El codigo arranca en
-//     CALENTANDO y los ignora.
+//   - LED testigo en GPIO2: en la mayoria de los DevKit ya viene el LED
+//     onboard ahi, asi que no hay que cablear nada. Si tu placa no lo trae,
+//     LED + resistencia de 220-330 ohm de GPIO2 a GND.
+//   - Warm-up: al energizarse tira HIGH espurios. El codigo arranca en
+//     CALENTANDO durante CALENTAMIENTO_MS y los ignora.
 //
 // ---------------------------------------------------------------------------
 // LOGICA
@@ -61,12 +64,23 @@
 // --- Pines (ajustar segun el cableado real) ---
 const uint8_t PIN_DOOR_SWITCH = 14;  // Switch de puerta: INPUT_PULLUP, LOW = puerta cerrada
 const uint8_t PIN_PIR         = 27;  // Pin OUT del modulo BISS0001/HC-SR501
-const uint8_t PIN_OUTPUT      = 2;   // Salida hacia rele/buzzer/LED de alarma
-                                     // OJO: GPIO2 es strapping pin y LED onboard.
-                                     // Sirve para probar; para un rele conviene
-                                     // mover a un GPIO libre (ej. 25, 26, 32, 33).
-                                     // Ademas, si algo lo levanta en el arranque,
-                                     // impide entrar en modo descarga al flashear.
+const uint8_t PIN_OUTPUT      = 26;  // Salida hacia rele/buzzer/LED de alarma.
+                                     // GPIO26 es un pin libre, sin funcion de
+                                     // arranque. Antes esto estaba en GPIO2, que
+                                     // es strapping pin y comparte el LED
+                                     // onboard: con un rele colgado ahi, su
+                                     // pull-up puede impedir entrar en modo
+                                     // descarga al flashear. NO volver a GPIO2.
+
+const uint8_t PIN_LED_TESTIGO = 2;   // LED testigo: espeja SIEMPRE el estado de
+                                     // PIN_OUTPUT para poder ver a simple vista
+                                     // cuando se activa la salida.
+                                     // GPIO2 es strapping pin, pero aca no hay
+                                     // problema: es el LED onboard de la placa
+                                     // (o un LED con su resistencia), no un rele.
+                                     // Lo que rompia el flasheo era el pull-up
+                                     // del rele, no el LED. Aun asi, NO colgar
+                                     // el rele de este pin.
 
 // --- Caracteristicas medidas del modulo PIR ---
 const bool PIR_ACTIVO_EN_ALTO = true;      // HC-SR501: OUT en HIGH = movimiento
@@ -87,13 +101,18 @@ const unsigned long ACTIVIDAD_MINIMA_MS = 8000;  // el tren ademas debe abarcar 
                                                  // mas rapido (jumper en H, otra placa) y
                                                  // aparecen rafagas cortas.
 const unsigned long PAUSA_MAXIMA_MS = 8000;      // hueco sin pulsos que corta el tren
-const unsigned long PULSO_LARGO_CONFIRMA_MS = 8000; // un solo pulso tan largo ya confirma
+const unsigned long PULSO_LARGO_CONFIRMA_MS = 5000; // un solo pulso tan largo ya confirma
                                                     // (caso jumper en H)
 
 // --- Parametros generales ---
 const unsigned long VENTANA_DETECCION_MS = 30000;  // 30s de vigilancia tras cerrar la puerta
 const unsigned long DOOR_OPEN_RESET_MS   = 300000; // 5 min de puerta abierta seguida -> apaga
-const unsigned long CALENTAMIENTO_MS     = 60000;  // estabilizacion del PIR al energizar
+const unsigned long CALENTAMIENTO_MS     = 10000;  // estabilizacion del PIR al energizar.
+                                                   // La hoja del HC-SR501 pide 30-60s, pero
+                                                   // con 60s el sistema quedaba mudo el primer
+                                                   // minuto tras cada flasheo/reset. Si al
+                                                   // arrancar aparecen disparos espurios,
+                                                   // subir esto es lo primero a probar.
 const unsigned long DEBOUNCE_MS          = 50;     // antirrebote del switch mecanico
 const unsigned long LOG_PERIODO_MS       = 1000;   // frecuencia del log de estado
 
@@ -143,6 +162,13 @@ unsigned long tUltimaBajada = 0;     // ultimo flanco de bajada
 // diagnostico no toque nada de la maquina de estados.
 bool pmNivelAnterior = false;
 unsigned long tPmSubida = 0;
+
+// Unico lugar donde se toca la salida. Escribe los dos pines juntos para que
+// el LED testigo no pueda quedar nunca desfasado de la salida real.
+void setSalida(bool encendida) {
+  digitalWrite(PIN_OUTPUT, encendida ? HIGH : LOW);
+  digitalWrite(PIN_LED_TESTIGO, encendida ? HIGH : LOW);
+}
 
 const char* nombreEstado(EstadoSistema e) {
   switch (e) {
@@ -200,7 +226,8 @@ void setup() {
   pinMode(PIN_PIR, INPUT_PULLDOWN); // si el pin queda flotando (cable suelto),
                                     // por defecto lee LOW = sin movimiento
   pinMode(PIN_OUTPUT, OUTPUT);
-  digitalWrite(PIN_OUTPUT, LOW);
+  pinMode(PIN_LED_TESTIGO, OUTPUT);
+  setSalida(false);
 
   tArranque = millis();
 
@@ -318,7 +345,7 @@ void loop() {
   } else if (estado == ARMADO) {
     if (actualizarActividadPir()) {
       estado = DISPARADO;
-      digitalWrite(PIN_OUTPUT, HIGH);
+      setSalida(true);
       Serial.print("Actividad confirmada (");
       Serial.print(pulsosTren);
       Serial.print(" pulsos en ");
@@ -330,7 +357,7 @@ void loop() {
       // No se confirmo actividad en esta ventana: si la salida venia encendida
       // de un ciclo anterior, se apaga aqui. La puerta sigue cerrada, asi que
       // se reinicia la ventana para seguir sensando sin parar.
-      digitalWrite(PIN_OUTPUT, LOW);
+      setSalida(false);
       tInicioArmado = millis();
       reiniciarTren();
       Serial.println("Ventana cumplida sin actividad sostenida. Salida en OFF. Reiniciando ventana.");
@@ -338,7 +365,7 @@ void loop() {
   } else if (estado == DISPARADO) {
     // Unica salida de este estado: puerta abierta de forma continua 5 minutos.
     if (!puertaCerradaEstable && (millis() - tPuertaAbiertaDesde >= DOOR_OPEN_RESET_MS)) {
-      digitalWrite(PIN_OUTPUT, LOW);
+      setSalida(false);
       estado = IDLE;
       Serial.println("Puerta abierta 5 minutos seguidos. Alarma apagada. Sistema en espera.");
     }
@@ -358,6 +385,8 @@ void loop() {
     Serial.print(leerPir() ? "MOVIMIENTO" : "quieto");
     Serial.print(" | salida=");
     Serial.print(digitalRead(PIN_OUTPUT) == HIGH ? "ON" : "off");
+    Serial.print(" | testigo_gpio2=");
+    Serial.print(digitalRead(PIN_LED_TESTIGO) == HIGH ? "ON" : "off");
 
     if (estado == CALENTANDO) {
       long faltaMs = (long)CALENTAMIENTO_MS - (long)(millis() - tArranque);
