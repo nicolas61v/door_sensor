@@ -11,28 +11,19 @@
 //   - Con alguien moviendose sin parar salen pulsos de 0.7s cada ~3s, muy
 //     regulares. Con un falso positivo (un bicho) sale UN pulso suelto.
 //
-// Que TODOS los pulsos midan exactamente lo mismo significa que el modulo no
-// re-extiende la salida: esta en modo L (single trigger). Con esta senal es
-// IMPOSIBLE tener HIGH continuo por mas de 0.7s, asi que la logica no puede
-// pedir "movimiento continuo durante N segundos": no disparia nunca.
-//
-// Por eso la confirmacion se hace por TREN DE PULSOS sostenido en el tiempo,
-// que es lo que separa de verdad a una persona de un falso positivo:
-//
-//   persona moviendose -> pulso cada ~3s, muchos seguidos
-//   bicho / corriente  -> un pulso solo
-//
-// Si algun dia pasas el jumper a H y el modulo empieza a dar pulsos largos,
-// tambien funciona: un unico pulso de mas de PULSO_LARGO_CONFIRMA_MS confirma
-// directo. No hay que tocar nada.
+// La logica NO intenta distinguir una persona de un falso positivo: basta un
+// pulso, el primero que llegue, para disparar. Lo unico que importa de lo
+// medido es el ciclo pulso+ceguera (~3.2s), porque marca cada cuanto puede el
+// modulo avisar y por lo tanto cuanto tiene que durar como minimo la ventana.
 //
 // ---------------------------------------------------------------------------
 // HARDWARE
 // ---------------------------------------------------------------------------
 //   - Pot "TIME" AL MINIMO (todo antihorario). Es el ajuste ya calibrado:
 //     da Tx = 0.7s. Si lo movés, hay que volver a medir con calibracionPIR.
-//   - Pot "SENS" a la mitad. Si hay falsos disparos, bajarlo antes que tocar
-//     el codigo.
+//   - Pot "SENS" a la mitad. Como ahora ALCANZA UN SOLO PULSO para disparar,
+//     este pot es la unica defensa contra falsos positivos: si hay disparos
+//     por bichos o corrientes de aire, bajarlo antes que tocar el codigo.
 //   - Alimentacion: VCC del PIR al pin 5V/VIN del ESP32 (lleva un regulador
 //     HT7133, con 3V3 no arranca). Su OUT entrega 3.3V: va directo al GPIO.
 //   - LED testigo en GPIO2: en la mayoria de los DevKit ya viene el LED
@@ -44,14 +35,25 @@
 // ---------------------------------------------------------------------------
 // LOGICA
 // ---------------------------------------------------------------------------
-// - Puerta cerrada -> se abre/reinicia una ventana de VENTANA_DETECCION_MS (30s)
-//   en la que hay que confirmar actividad para disparar.
-// - Si se confirma dentro de esos 30s, la salida se activa/mantiene en ON y el
-//   sistema deja de sensar hasta el proximo cierre de puerta.
-// - Si NO se confirma en los 30s, la salida se pone/queda en OFF y la ventana
-//   se reinicia sola (sigue sensando sin parar mientras la puerta siga cerrada).
-// - Abrir la puerta nunca afecta nada por si sola (ni cancela la ventana, ni
-//   apaga la salida): la salida se queda como estaba.
+// El sensor NO esta escuchando todo el tiempo: solo sensa durante la ventana de
+// un minuto que abre el cierre de la puerta. Fuera de esa ventana el PIR se
+// ignora por completo.
+//
+// - Cerrar la puerta -> se abre una ventana de VENTANA_DETECCION_MS (1 min) en
+//   la que hay que detectar movimiento para disparar.
+// - BASTA UN SOLO PULSO del PIR: apenas detecta algo, dispara. No se exige tren
+//   de pulsos ni duracion minima. Es a proposito: se prioriza no perderse
+//   ninguna deteccion por encima de filtrar falsos positivos.
+// - Si detecta dentro de ese minuto, la salida se activa/mantiene en ON y el
+//   sistema deja de sensar.
+// - Si NO detecta nada en el minuto, la salida se pone/queda en OFF y el sistema
+//   tambien deja de sensar. La ventana NO se reinicia sola: aunque la puerta
+//   siga cerrada, el PIR queda ignorado.
+// - En los dos casos el sistema queda dormido hasta el proximo ciclo de puerta:
+//   hay que abrirla y volver a cerrarla para que se arme una ventana nueva.
+// - Abrir la puerta nunca afecta nada por si sola (ni arma la ventana, ni
+//   cancela una en curso, ni apaga la salida): la salida se queda como estaba y
+//   el sensado recien arranca cuando la puerta se vuelve a cerrar.
 // - Cerrar la puerta SIEMPRE reactiva el sensado, sin importar el estado previo
 //   (incluso si ya estaba DISPARADO). Es el resultado de esa nueva ventana el
 //   que decide si la salida se queda en ON o pasa a OFF.
@@ -91,21 +93,8 @@ const unsigned long PIR_BLOQUEO_MS = 2500; // ceguera entre pulsos (MEDIDO ~2.2-
 // para ver si el modulo cambio de comportamiento. Solo escribe en los flancos.
 const bool LOG_PULSOS_PIR = true;
 
-// --- Reglas de confirmacion ---
-const uint8_t PULSOS_PARA_CONFIRMAR = 4;      // pulsos del tren para dar por buena la actividad
-const unsigned long ACTIVIDAD_MINIMA_MS = 8000;  // el tren ademas debe abarcar este lapso.
-                                                 // Con ESTE modulo la condicion no llega a
-                                                 // actuar: el blocking time ya obliga a que
-                                                 // 4 pulsos tarden >=9.6s. Queda como red de
-                                                 // seguridad por si el modulo pasa a pulsar
-                                                 // mas rapido (jumper en H, otra placa) y
-                                                 // aparecen rafagas cortas.
-const unsigned long PAUSA_MAXIMA_MS = 8000;      // hueco sin pulsos que corta el tren
-const unsigned long PULSO_LARGO_CONFIRMA_MS = 5000; // un solo pulso tan largo ya confirma
-                                                    // (caso jumper en H)
-
 // --- Parametros generales ---
-const unsigned long VENTANA_DETECCION_MS = 30000;  // 30s de vigilancia tras cerrar la puerta
+const unsigned long VENTANA_DETECCION_MS = 60000;  // 1 min de vigilancia tras cerrar la puerta
 const unsigned long DOOR_OPEN_RESET_MS   = 300000; // 5 min de puerta abierta seguida -> apaga
 const unsigned long CALENTAMIENTO_MS     = 10000;  // estabilizacion del PIR al energizar.
                                                    // La hoja del HC-SR501 pide 30-60s, pero
@@ -116,28 +105,19 @@ const unsigned long CALENTAMIENTO_MS     = 10000;  // estabilizacion del PIR al 
 const unsigned long DEBOUNCE_MS          = 50;     // antirrebote del switch mecanico
 const unsigned long LOG_PERIODO_MS       = 1000;   // frecuencia del log de estado
 
-// Chequeos de coherencia contra el comportamiento medido del modulo.
-static_assert(PAUSA_MAXIMA_MS > PIR_TX_MS + PIR_BLOQUEO_MS,
-              "PAUSA_MAXIMA_MS tiene que tolerar un ciclo completo de ceguera del modulo, "
-              "si no el tren se corta solo entre pulsos normales y nunca confirma.");
-static_assert(PULSOS_PARA_CONFIRMAR >= 2,
-              "Con un solo pulso no se distingue una persona de un bicho.");
-// El tren completo tiene que entrar comodo en la ventana. Con este modulo N
-// pulsos no pueden llegar mas rapido que (N-1)*(Tx+bloqueo), asi que la ventana
-// tiene que cubrir eso y todavia dejar margen.
-static_assert(VENTANA_DETECCION_MS >
-                  (PULSOS_PARA_CONFIRMAR - 1) * (PIR_TX_MS + PIR_BLOQUEO_MS) + PAUSA_MAXIMA_MS,
-              "La ventana es muy corta para juntar PULSOS_PARA_CONFIRMAR pulsos al ritmo que "
-              "permite el modulo: subir la ventana o bajar la cantidad de pulsos.");
-static_assert(VENTANA_DETECCION_MS > ACTIVIDAD_MINIMA_MS + PAUSA_MAXIMA_MS,
-              "La ventana debe dar tiempo a formar el tren completo dentro de ella.");
+// Chequeo de coherencia contra el comportamiento medido del modulo: la ventana
+// tiene que cubrir de sobra un ciclo completo (pulso + ceguera). Si fuera mas
+// corta podria abrirse y cerrarse entera mientras el PIR esta ciego, y perderse
+// a alguien que si se estaba moviendo.
+static_assert(VENTANA_DETECCION_MS > 2 * (PIR_TX_MS + PIR_BLOQUEO_MS),
+              "La ventana apenas cubre un ciclo de ceguera del modulo: subirla.");
 
 // --- Estados del sistema ---
 enum EstadoSistema {
   CALENTANDO, // el PIR todavia se esta estabilizando: se ignora su salida
-  IDLE,       // esperando: puerta abierta, o cerrada pero aun sin armar ventana
-  ARMADO,     // puerta cerrada, evaluando actividad dentro de la ventana
-  DISPARADO   // actividad confirmada, salida fija en ON hasta el reset por puerta abierta
+  IDLE,       // dormido: el PIR se ignora. Se sale de aqui solo al cerrar la puerta
+  ARMADO,     // puerta cerrada, esperando movimiento dentro de la ventana
+  DISPARADO   // movimiento detectado, salida fija en ON hasta el reset por puerta abierta
 };
 
 EstadoSistema estado = CALENTANDO;
@@ -151,12 +131,8 @@ unsigned long tInicioArmado = 0;
 unsigned long tPuertaAbiertaDesde = 0; // momento en que la puerta paso a ABIERTA
 unsigned long tUltimoLog = 0;
 
-// --- Seguimiento del tren de pulsos ---
+// --- Seguimiento del PIR ---
 bool pirNivel = false;               // ultimo nivel logico leido del PIR
-uint8_t pulsosTren = 0;              // pulsos acumulados en el tren actual
-unsigned long tPrimerPulsoTren = 0;  // inicio del tren actual
-unsigned long tPulsoActualDesde = 0; // inicio del pulso en curso
-unsigned long tUltimaBajada = 0;     // ultimo flanco de bajada
 
 // Variables propias del medidor de pulsos: separadas a proposito para que el
 // diagnostico no toque nada de la maquina de estados.
@@ -205,18 +181,17 @@ void medirPulsosPir() {
   pmNivelAnterior = pir;
 }
 
-void reiniciarTren() {
-  pirNivel          = false;
-  pulsosTren        = 0;
-  tPrimerPulsoTren  = 0;
-  tPulsoActualDesde = 0;
-  tUltimaBajada     = 0;
+// Arranca el seguimiento del PIR tomando su nivel actual como punto de partida.
+// Si el modulo esta en medio de un pulso justo cuando se arma la ventana, ese
+// pulso viejo no cuenta: solo dispara un flanco de subida nuevo.
+void reiniciarDeteccion() {
+  pirNivel = leerPir();
 }
 
 void armarVentana() {
   estado = ARMADO;
   tInicioArmado = millis();
-  reiniciarTren();
+  reiniciarDeteccion();
 }
 
 void setup() {
@@ -239,7 +214,7 @@ void setup() {
 
   // No se arma nada todavia: el HC-SR501 tira falsos HIGH mientras calienta.
   estado = CALENTANDO;
-  reiniciarTren();
+  reiniciarDeteccion();
   pmNivelAnterior = leerPir(); // evita reportar un pulso falso al arrancar
 
   Serial.print("Sistema listo. Calentando el PIR ");
@@ -265,45 +240,13 @@ bool actualizarSwitchPuerta() {
   return false;
 }
 
-// Sigue el tren de pulsos del PIR. Devuelve true cuando la actividad queda
-// confirmada como movimiento real.
+// Devuelve true en el flanco de subida del PIR: un solo pulso ya basta para dar
+// la deteccion por buena.
 bool actualizarActividadPir() {
-  unsigned long ahora = millis();
   bool pir = leerPir();
-
-  if (pir && !pirNivel) {          // flanco de subida: empieza un pulso
-    // Si paso demasiado tiempo desde el ultimo pulso, el tren anterior murio
-    // y este pulso arranca uno nuevo.
-    if (pulsosTren > 0 && (ahora - tUltimaBajada) > PAUSA_MAXIMA_MS) {
-      pulsosTren = 0;
-    }
-    if (pulsosTren == 0) {
-      tPrimerPulsoTren = ahora;
-    }
-    if (pulsosTren < 255) {
-      pulsosTren++;
-    }
-    tPulsoActualDesde = ahora;
-
-  } else if (!pir && pirNivel) {   // flanco de bajada: termina el pulso
-    tUltimaBajada = ahora;
-  }
-
-  // Estando en bajo, el tren caduca si la pausa se hace demasiado larga
-  if (!pir && pulsosTren > 0 && (ahora - tUltimaBajada) > PAUSA_MAXIMA_MS) {
-    pulsosTren = 0;
-  }
-
+  bool flancoDeSubida = (pir && !pirNivel);
   pirNivel = pir;
-
-  // Caso normal (modo L): varios pulsos repartidos en el tiempo.
-  bool porTren = (pulsosTren >= PULSOS_PARA_CONFIRMAR) &&
-                 ((ahora - tPrimerPulsoTren) >= ACTIVIDAD_MINIMA_MS);
-
-  // Caso jumper en H: un unico pulso sostenido ya alcanza.
-  bool porPulsoLargo = pir && ((ahora - tPulsoActualDesde) >= PULSO_LARGO_CONFIRMA_MS);
-
-  return porTren || porPulsoLargo;
+  return flancoDeSubida;
 }
 
 void loop() {
@@ -346,21 +289,18 @@ void loop() {
     if (actualizarActividadPir()) {
       estado = DISPARADO;
       setSalida(true);
-      Serial.print("Actividad confirmada (");
-      Serial.print(pulsosTren);
-      Serial.print(" pulsos en ");
-      Serial.print((millis() - tPrimerPulsoTren) / 1000.0, 1);
-      Serial.println("s). Salida activada y fija en ON.");
+      Serial.print("Movimiento detectado a los ");
+      Serial.print((millis() - tInicioArmado) / 1000.0, 1);
+      Serial.println("s de la ventana. Salida activada y fija en ON.");
     }
 
     if (estado == ARMADO && millis() - tInicioArmado >= VENTANA_DETECCION_MS) {
-      // No se confirmo actividad en esta ventana: si la salida venia encendida
-      // de un ciclo anterior, se apaga aqui. La puerta sigue cerrada, asi que
-      // se reinicia la ventana para seguir sensando sin parar.
+      // Se cumplio el minuto sin movimiento: la salida se apaga (por si venia
+      // encendida de un ciclo anterior) y el sistema DEJA DE SENSAR. La ventana
+      // NO se reinicia sola: solo la reactiva el proximo cierre de puerta.
       setSalida(false);
-      tInicioArmado = millis();
-      reiniciarTren();
-      Serial.println("Ventana cumplida sin actividad sostenida. Salida en OFF. Reiniciando ventana.");
+      estado = IDLE;
+      Serial.println("Ventana cumplida sin movimiento. Salida en OFF. En espera hasta el proximo cierre de puerta.");
     }
   } else if (estado == DISPARADO) {
     // Unica salida de este estado: puerta abierta de forma continua 5 minutos.
@@ -399,18 +339,7 @@ void loop() {
       if (restanteMs < 0) restanteMs = 0;
       Serial.print(" | ventana_restante=");
       Serial.print(restanteMs / 1000);
-      Serial.print("s | pulsos=");
-      Serial.print(pulsosTren);
-      Serial.print("/");
-      Serial.print(PULSOS_PARA_CONFIRMAR);
-
-      if (pulsosTren > 0) {
-        Serial.print(" | tren=");
-        Serial.print((millis() - tPrimerPulsoTren) / 1000.0, 1);
-        Serial.print("s/");
-        Serial.print(ACTIVIDAD_MINIMA_MS / 1000);
-        Serial.print("s");
-      }
+      Serial.print("s");
     } else if (estado == DISPARADO && !puertaCerradaEstable) {
       long abiertaMs = (long)(millis() - tPuertaAbiertaDesde);
       long faltaMs = (long)DOOR_OPEN_RESET_MS - abiertaMs;
